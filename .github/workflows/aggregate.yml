@@ -30,7 +30,7 @@ concurrency:
 
 env:
   OWNER: rob-land
-  APPS: "lighthouse"
+  APPS: "lighthouse holler"
   SUITE: stable
   COMPONENT: main
   ARCHES: "amd64 arm64"

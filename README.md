@@ -74,8 +74,15 @@ to what Debian-derived phone distros actually ship.
 | App | Why | Status |
 | --- | --- | --- |
 | [lighthouse] | systemd user unit for the always-on find-my agent; needs `wpctl` to override silent mode and raw LAN access for KDE Connect | packaged |
-| [patch] | ships a hand-copied `patch-warm-resident.service.example` that users must install by hand — exactly what a `.deb` automates, OOM tuning included | candidate |
+| [holler] | warm-resident systemd user unit, so an incoming call reaches an already-connected client instead of paying the cold-start tax | packaged |
 | [pulse] | headless health-data daemon other apps talk to over D-Bus; a system-wide service is a poor fit for a per-user sandbox | candidate |
+
+Holler was called Patch until it was packaged: GNU patch owns both the
+`patch` package name and `/usr/bin/patch`, and dpkg will not let a second
+package take that path. It's a good illustration of the tax a host
+package pays that a sandboxed one doesn't — worth checking a name against
+`apt-cache policy` and `apt-file search /usr/bin/<name>` before adding an
+app here.
 
 Everything else in the suite is a plain sandboxed GUI and should stay
 Flatpak-only.
@@ -94,5 +101,5 @@ per-repo, so it has to be set here regardless.
 
 [flatpak-repo]: https://github.com/rob-land/flatpak-repo
 [lighthouse]: https://github.com/rob-land/lighthouse
-[patch]: https://github.com/rob-land/patch
+[holler]: https://github.com/rob-land/holler
 [pulse]: https://github.com/rob-land/pulse
