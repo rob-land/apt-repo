@@ -46,6 +46,24 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Checked first: without a key the run dies in `gpg --import` with a
+      # bare "no valid OpenPGP data found" several minutes in, which reads
+      # like a corrupt key rather than a missing one. An unsigned repo is
+      # not a fallback — apt would refuse it — so this is a hard failure.
+      - name: Check the signing secrets are configured
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          missing=""
+          if [ -z "$GPG_PRIVATE_KEY" ]; then missing="$missing APT_GPG_PRIVATE_KEY"; fi
+          if [ -z "$GPG_KEY_ID" ]; then missing="$missing APT_GPG_KEY_ID"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::Signing secrets not set on ${GITHUB_REPOSITORY}:${missing}. Set them with: gpg --export-secret-keys --armor <KEY_ID> | gh secret set APT_GPG_PRIVATE_KEY --repo ${GITHUB_REPOSITORY} && gh secret set APT_GPG_KEY_ID --body <KEY_ID> --repo ${GITHUB_REPOSITORY}"
+            exit 1
+          fi
+          echo "signing key ${GPG_KEY_ID} configured"
+
       - name: Install apt-utils
         run: |
           sudo apt-get update
@@ -143,6 +161,13 @@ jobs:
           GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
         run: |
           printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # Confirm the imported key is the one we are about to sign with,
+          # so a rotated or mismatched KEY_ID fails here rather than
+          # producing a Release apt cannot verify.
+          if ! gpg --list-secret-keys "$GPG_KEY_ID" >/dev/null 2>&1; then
+            echo "::error::APT_GPG_KEY_ID ($GPG_KEY_ID) is not among the imported secret keys"
+            exit 1
+          fi
           dist="site/dists/${SUITE}"
           # Release.gpg for apt's detached form, InRelease for the inline
           # form modern apt prefers; ship both so old sources.list entries
