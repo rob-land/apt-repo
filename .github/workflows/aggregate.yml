@@ -1,0 +1,190 @@
+name: Aggregate
+
+# Collects the .debs that every rob-land app's CI uploads to its rolling
+# `continuous` GitHub release, indexes them with apt-ftparchive, GPG-signs
+# the result and publishes the combined repo to GitHub Pages:
+#
+#   sudo curl -fsSLo /usr/share/keyrings/rob-land.gpg \
+#     https://rob-land.github.io/apt-repo/rob-land.gpg
+#   echo "deb [signed-by=/usr/share/keyrings/rob-land.gpg] \
+#     https://rob-land.github.io/apt-repo stable main" \
+#     | sudo tee /etc/apt/sources.list.d/rob-land.list
+#
+# Runs hourly (release downloads are anonymous, so app repos need no
+# cross-repo tokens) and on manual dispatch. App CIs can shorten the
+# latency by dispatching this workflow with a PAT — see the app
+# workflows' optional AGGREGATOR_DISPATCH_TOKEN step.
+#
+# Secrets required:
+#   APT_GPG_PRIVATE_KEY   armored `gpg --export-secret-keys --armor <KEY_ID>`
+#   APT_GPG_KEY_ID        the key id used to sign InRelease
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: aggregate
+  cancel-in-progress: false
+
+env:
+  OWNER: rob-land
+  APPS: "lighthouse"
+  SUITE: stable
+  COMPONENT: main
+  ARCHES: "amd64 arm64"
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Install apt-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apt-utils
+
+      - name: Fetch every app's continuous-release debs
+        run: |
+          mkdir -p incoming
+          any=0
+          for app in $APPS; do
+            url="https://github.com/${OWNER}/${app}/releases/download/continuous/debs.tar"
+            if curl -fsSL --retry 3 -o "incoming/${app}.tar" "$url"; then
+              echo "fetched ${app}"
+              any=1
+            else
+              rm -f "incoming/${app}.tar"
+              echo "::warning::${app} has no debs.tar in its continuous release — skipped"
+            fi
+          done
+          [ "$any" = 1 ] || { echo "::error::no app produced a debs.tar"; exit 1; }
+
+      - name: Lay out the pool
+        run: |
+          mkdir -p extract "site/pool/${COMPONENT}"
+          for tarball in incoming/*.tar; do
+            tar -xf "$tarball" -C extract
+          done
+          # Debian pool convention: pool/<component>/<prefix>/<source>/,
+          # where prefix is the first letter (or first four for lib*).
+          find extract -name '*.deb' -print0 | while IFS= read -r -d '' deb; do
+            pkg=$(dpkg-deb -f "$deb" Package)
+            case "$pkg" in
+              lib*) prefix=$(printf '%s' "$pkg" | cut -c1-4) ;;
+              *)    prefix=$(printf '%s' "$pkg" | cut -c1)   ;;
+            esac
+            dest="site/pool/${COMPONENT}/${prefix}/${pkg}"
+            mkdir -p "$dest"
+            cp "$deb" "$dest/"
+          done
+          find site/pool -name '*.deb' | sort
+
+      - name: Generate the package indexes
+        run: |
+          cd site
+          for arch in $ARCHES; do
+            dir="dists/${SUITE}/${COMPONENT}/binary-${arch}"
+            mkdir -p "$dir"
+            apt-ftparchive --arch="$arch" packages pool > "$dir/Packages"
+            # Every package in this suite is Architecture: all, so an
+            # empty per-arch index means the arch filter dropped them —
+            # fail loudly rather than publish a repo that resolves to
+            # nothing on the phone.
+            if [ ! -s "$dir/Packages" ]; then
+              echo "::error::no packages indexed for ${arch}"
+              exit 1
+            fi
+            gzip -9kf "$dir/Packages"
+            echo "${arch}: $(grep -c '^Package:' "$dir/Packages") package(s)"
+          done
+
+      - name: Generate the Release file
+        run: |
+          cd site
+          # No Valid-Until: this repo is regenerated on an hourly cron and
+          # an expiry would turn a quiet week into apt errors on the phone.
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin="rob-land" \
+            -o APT::FTPArchive::Release::Label="rob-land apps" \
+            -o APT::FTPArchive::Release::Suite="${SUITE}" \
+            -o APT::FTPArchive::Release::Codename="${SUITE}" \
+            -o APT::FTPArchive::Release::Architectures="${ARCHES}" \
+            -o APT::FTPArchive::Release::Components="${COMPONENT}" \
+            -o APT::FTPArchive::Release::Description="GTK4/libadwaita apps for Debian-based Linux phones" \
+            release "dists/${SUITE}" > "dists/${SUITE}/Release"
+          cat "dists/${SUITE}/Release"
+
+      - name: Skip the deploy when no package changed
+        id: change
+        run: |
+          state=$(cat site/dists/${SUITE}/${COMPONENT}/binary-*/Packages \
+                    | sha256sum | cut -d' ' -f1)
+          live=$(curl -fsSL "https://${OWNER}.github.io/apt-repo/state.txt" || echo none)
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = "$live" ] && [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no changes since the live deploy — skipping"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign the release
+        if: steps.change.outputs.changed == 'true'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+        run: |
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          dist="site/dists/${SUITE}"
+          # Release.gpg for apt's detached form, InRelease for the inline
+          # form modern apt prefers; ship both so old sources.list entries
+          # keep working.
+          gpg --batch --yes --local-user "$GPG_KEY_ID" \
+            --armor --detach-sign -o "${dist}/Release.gpg" "${dist}/Release"
+          gpg --batch --yes --local-user "$GPG_KEY_ID" \
+            --clearsign -o "${dist}/InRelease" "${dist}/Release"
+          # Binary keyring for [signed-by=...]; armored for anyone piping
+          # it through gpg --dearmor themselves.
+          gpg --export "$GPG_KEY_ID" > site/rob-land.gpg
+          gpg --export --armor "$GPG_KEY_ID" > site/rob-land.asc
+
+      - name: Write the landing page and state marker
+        if: steps.change.outputs.changed == 'true'
+        env:
+          STATE: ${{ steps.change.outputs.state }}
+        run: |
+          base_url="https://${OWNER}.github.io/apt-repo"
+          printf '%s' "$STATE" > site/state.txt
+          {
+            echo '<!doctype html><meta charset="utf-8">'
+            echo '<title>rob-land apt repo</title><pre>'
+            echo "sudo curl -fsSLo /usr/share/keyrings/rob-land.gpg ${base_url}/rob-land.gpg"
+            echo "echo \"deb [signed-by=/usr/share/keyrings/rob-land.gpg] ${base_url} ${SUITE} ${COMPONENT}\" \\"
+            echo "  | sudo tee /etc/apt/sources.list.d/rob-land.list"
+            echo "sudo apt update"
+            echo
+            echo "# then any of:"
+            grep '^Package:' "site/dists/${SUITE}/${COMPONENT}/binary-amd64/Packages" \
+              | cut -d' ' -f2 | sort -u | sed 's/^/sudo apt install /'
+            echo '</pre>'
+          } > site/index.html
+
+      - uses: actions/configure-pages@v6
+        if: steps.change.outputs.changed == 'true'
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.change.outputs.changed == 'true'
+        with:
+          path: site
+
+      - id: deployment
+        if: steps.change.outputs.changed == 'true'
+        uses: actions/deploy-pages@v5
